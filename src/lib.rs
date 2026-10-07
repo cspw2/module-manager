@@ -15,6 +15,7 @@ pub struct ModuleHandle {
     instance_ptr: *mut Box<dyn Module>,
     destroy_fn: DestroyModuleFn,
     metadata: ModuleMetadata,
+    _temp_dir: Option<tempfile::TempDir>,
 }
 
 // ModuleHandle is safe to send across threads if the module is Send + Sync
@@ -22,6 +23,41 @@ unsafe impl Send for ModuleHandle {}
 unsafe impl Sync for ModuleHandle {}
 
 impl ModuleHandle {
+    unsafe fn from_library(
+        library: Library,
+        temp_dir: Option<tempfile::TempDir>,
+    ) -> Result<Self> {
+        let (destroy_fn, instance_ptr, metadata) = unsafe {
+            let create_sym = library
+                .get::<CreateModuleFn>(b"cspw_module_create\0")
+                .context("Symbol 'cspw_module_create' not found in module")?;
+            let create_fn = *create_sym;
+
+            let destroy_sym = library
+                .get::<DestroyModuleFn>(b"cspw_module_destroy\0")
+                .context("Symbol 'cspw_module_destroy' not found in module")?;
+            let destroy_fn = *destroy_sym;
+
+            let instance_ptr = (create_fn)();
+            if instance_ptr.is_null() {
+                return Err(anyhow!("Module creation returned a null pointer"));
+            }
+
+            let module: &Box<dyn Module> = &*instance_ptr;
+            let metadata = module.metadata();
+
+            (destroy_fn, instance_ptr, metadata)
+        };
+
+        Ok(Self {
+            _library: library,
+            instance_ptr,
+            destroy_fn,
+            metadata,
+            _temp_dir: temp_dir,
+        })
+    }
+
     pub fn metadata(&self) -> &ModuleMetadata {
         &self.metadata
     }
@@ -62,7 +98,7 @@ impl ModuleManager {
         }
     }
 
-    /// Load a compiled dynamic library (.dll / .so / .dylib)
+    /// Load a compiled dynamic library (.dll / .so / .dylib) from a file path
     pub fn load_module<P: AsRef<Path>>(&mut self, path: P) -> Result<&ModuleMetadata> {
         let path_ref = path.as_ref();
         let library = unsafe {
@@ -70,40 +106,65 @@ impl ModuleManager {
                 .with_context(|| format!("Failed to load dynamic library at {:?}", path_ref))?
         };
 
-        let create_fn = unsafe {
-            let symbol = library
-                .get::<CreateModuleFn>(b"cspw_module_create\0")
-                .context("Symbol 'cspw_module_create' not found in module")?;
-            *symbol
-        };
-
-        let destroy_fn = unsafe {
-            let symbol = library
-                .get::<DestroyModuleFn>(b"cspw_module_destroy\0")
-                .context("Symbol 'cspw_module_destroy' not found in module")?;
-            *symbol
-        };
-
-        let instance_ptr = unsafe { (create_fn)() };
-        if instance_ptr.is_null() {
-            return Err(anyhow!("Module creation returned a null pointer"));
-        }
-
-        let metadata = unsafe {
-            let module: &Box<dyn Module> = &*instance_ptr;
-            module.metadata()
-        };
-
-        let name = metadata.name.clone();
-        let handle = ModuleHandle {
-            _library: library,
-            instance_ptr,
-            destroy_fn,
-            metadata,
-        };
-
+        let handle = unsafe { ModuleHandle::from_library(library, None)? };
+        let name = handle.metadata.name.clone();
         self.modules.insert(name.clone(), handle);
         Ok(&self.modules.get(&name).unwrap().metadata)
+    }
+
+    /// Load a compiled dynamic library directly from file bytes (.dll / .so / .dylib)
+    pub fn load_from_bytes(&mut self, bytes: &[u8]) -> Result<&ModuleMetadata> {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("cspw_module_")
+            .tempdir()
+            .context("Failed to create temporary directory for module")?;
+
+        let ext = std::env::consts::DLL_EXTENSION;
+        let file_path = temp_dir.path().join(format!("module.{}", ext));
+
+        std::fs::write(&file_path, bytes)
+            .with_context(|| format!("Failed to write module bytes to {:?}", file_path))?;
+
+        let library = unsafe {
+            Library::new(&file_path)
+                .with_context(|| format!("Failed to load dynamic library from {:?}", file_path))?
+        };
+
+        let handle = unsafe { ModuleHandle::from_library(library, Some(temp_dir))? };
+        let name = handle.metadata.name.clone();
+        self.modules.insert(name.clone(), handle);
+        Ok(&self.modules.get(&name).unwrap().metadata)
+    }
+
+    /// Inspect a compiled dynamic library directly from file bytes to extract its metadata without keeping it loaded
+    pub fn inspect_from_bytes(&self, bytes: &[u8]) -> Result<ModuleMetadata> {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("cspw_module_inspect_")
+            .tempdir()
+            .context("Failed to create temporary directory for module inspection")?;
+
+        let ext = std::env::consts::DLL_EXTENSION;
+        let file_path = temp_dir.path().join(format!("module_inspect.{}", ext));
+
+        std::fs::write(&file_path, bytes)
+            .with_context(|| format!("Failed to write module bytes to {:?}", file_path))?;
+
+        let library = unsafe {
+            Library::new(&file_path)
+                .with_context(|| format!("Failed to load dynamic library from {:?}", file_path))?
+        };
+
+        let handle = unsafe { ModuleHandle::from_library(library, Some(temp_dir))? };
+        Ok(handle.metadata.clone())
+    }
+
+    /// Unload a loaded module by its name
+    pub fn unload_module(&mut self, name: &str) -> Result<()> {
+        if self.modules.remove(name).is_some() {
+            Ok(())
+        } else {
+            Err(anyhow!("Module '{}' not loaded", name))
+        }
     }
 
     /// Scan a directory and load all modules

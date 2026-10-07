@@ -85,4 +85,52 @@ fn test_compile_and_load_example_module() {
         }
         _ => panic!("Expected ApiResponse::Download"),
     }
+
+    // 6. Test unload_module
+    assert!(manager.get_metadata("HORAS 24C16").is_some());
+    assert_eq!(manager.list_modules().len(), 1);
+
+    manager
+        .unload_module("HORAS 24C16")
+        .expect("Failed to unload module");
+
+    assert!(manager.get_metadata("HORAS 24C16").is_none());
+    assert_eq!(manager.list_modules().len(), 0);
+
+    // Unloading non-existent module should error
+    assert!(manager.unload_module("HORAS 24C16").is_err());
+
+    // Executing after unload should error
+    assert!(
+        manager
+            .execute("HORAS 24C16", "read_km", &mut binary_file, &serde_json::Value::Null)
+            .is_err()
+    );
+
+    // 7. Test load_from_bytes
+    let dll_bytes = std::fs::read(&path).expect("Failed to read DLL file bytes");
+    let bytes_meta = manager
+        .load_from_bytes(&dll_bytes)
+        .expect("Failed to load module from bytes");
+
+    assert_eq!(bytes_meta.name, "HORAS 24C16");
+    assert_eq!(manager.list_modules().len(), 1);
+
+    // Verify execution works on module loaded from bytes
+    let read_res_bytes = manager
+        .execute("HORAS 24C16", "read_km", &mut binary_file, &serde_json::Value::Null)
+        .expect("read_km on byte-loaded module failed");
+
+    match read_res_bytes {
+        ApiResponse::Ok(val) => {
+            assert_eq!(val["km"], 250); // was updated to 250 in previous test step
+        }
+        _ => panic!("Expected ApiResponse::Ok"),
+    }
+
+    // Unload the byte-loaded module and verify temp directory cleanup
+    manager
+        .unload_module("HORAS 24C16")
+        .expect("Failed to unload byte-loaded module");
+    assert_eq!(manager.list_modules().len(), 0);
 }
