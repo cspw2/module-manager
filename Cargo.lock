@@ -23,6 +23,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 [[package]]
 name = "cspw-module-sdk"
 version = "0.1.0"
+source = "git+https://github.com/cspw2/cspw-module-sdk#76a563479c94326698c4fa464320e3c6612cd4f7"
 dependencies = [
  "anyhow",
  "serde",
